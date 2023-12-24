@@ -1,0 +1,401 @@
+---
+title: "BXH dataset analysis Single cell Omics"
+name: "Surya Hembrom"
+matri. nr: 229578
+output: html_notebook
+---
+
+# dataset: BXH
+```{r}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+```
+
+```{r}
+load("BXH.rds")
+class(counts)
+bxh <- as.data.frame(counts)
+```
+```{r}
+bxh <- CreateSeuratObject(counts = bxh, 
+                           project = "bxh", # name of the project
+                           min.cells = 3,   # include features present in min 3 cells (columns)
+                           min.features = 50 # include cells with atleast 50 features/genes (rows)
+                           )
+bxh
+```
+# Quality control 
+# remove mitochondrial genes from the human sample
+```{r}
+
+# to check if there are any mitochondrial genes present the data matrix
+mt_genes<- bxh[grep('^MT-', rownames(bxh)),]
+
+nrow(mt_genes) 
+mt_genes 
+
+head(mt_genes)
+#n_feature_RNA: are the unique genes 
+#nCount_RNA: are the number of total molecules in each cell
+```
+```{r}
+# calculation of mitochondrial percentage per cell 
+bxh[["percent_mt"]] <- PercentageFeatureSet(bxh, pattern = "^MT-")
+
+# Show QC metrics for the first 5 cells
+head(bxh@meta.data, 5)
+
+```
+```{r}
+# visualize QC metrics as violin plot
+p1<- VlnPlot(bxh, features = c("nFeature_RNA", "nCount_RNA", "percent_mt"), ncol = 3, pt.size = 0.01)
+
+p1 # nearly all cells have around median 5% mitochondrial genes mapped reads 
+```
+#### FeatureScatter is typically used to visualize feature-feature relationships, but can be used for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+```{r}
+
+plot1 <- FeatureScatter(bxh, feature1 = "nCount_RNA", feature2 = "percent_mt")
+plot2 <- FeatureScatter(bxh, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+# the relationship between the n_feature_RNA ie number of unique genes and nCount_RNA ie. number of molecules per cell is correlation of 0.57
+# whereas the % of mitochondrial genes vs nCount_RNA is not correlated positively
+
+
+```
+
+# Filter the cells based on QC values
+```{r}
+
+bxh <- subset(bxh, subset = nFeature_RNA > 200 &  # i.e. number of genes per cell is > 200
+                  nFeature_RNA < 2500 & # < 2500 to remove overly expressed genes due other factors such as drop-outs and cells in different stage of growth, cell heterogeneity and more expressed genes 
+                  percent_mt < 5) # remove the cells with mitochondrial genes mapping less than 5%
+bxh
+# 873 cells are retained after the the QC filtering for the genes per cell and removal of cells with high mitochondrial genes mapped reads, low quality and dying cells have high mitochondrial contamination
+
+```
+
+# Normalisation: with log.normalisation of feature expression by total expression by multiplying it by scale factor 10,000 and log transform the results to reduce skewness
+# other normalisation is scTransform that depends on the normalisation based on turning the expression data into negative binomial regression for UMI count data 
+```{r}
+
+
+bxh <- NormalizeData(bxh, 
+                      normalization.method = "LogNormalize", 
+                      scale.factor = 10000)
+
+bxh[["RNA"]]@data[1:10,1:30]
+
+```
+
+# identification of highly variable features: these are of interest as they are present variably in different cells and are expressed differently with higher expression levels in some cells than others
+# the mean variance relationship is modelled for the single cell data
+# the top 2000 features will be used for PCA and subsequent cluster analysis downstream.
+
+
+```{r}
+
+# fit a line to the relationship of log(variance) and log(mean) using loess (local polynomial regression), then standardize the feature values based on observed mean and expected variance
+bxh <- FindVariableFeatures(bxh, 
+                             selection.method = "vst",
+                             nfeatures = 2000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(bxh), 10)
+
+# plot variable features with labels
+plot1 <- VariableFeaturePlot(bxh)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot2
+
+```
+
+# scale the data: apply linear transformation to the expression data of each gene: standard preprocessing step before PCA and cluster analysis
+# scaling: 
+-scale the expression of each gene such  that mean is 0 and variance 1 (zscale transformation)
+-scaling gives equal weight to all genes be it highly expressed genes
+
+```{r}
+all_genes <- rownames(bxh) # perform scaling on all genes (by default, only the top 2000 are scaled)
+
+bxh <- ScaleData(bxh, 
+                  features = all_genes)
+
+bxh[["RNA"]]@scale.data[1:5,1:5]
+
+
+```
+# score the cell based on their cell cycle scores so that the genes which are in G2/M and S phase do not overdominate the G1 phase when the cell level gene expressions are lower 
+# for this load the data for the G2/M an S cell cycle markers 
+```{r}
+# data from Tirosh et al. that has information for such cell cycle markers 
+
+s_genes <- cc.genes$s.genes
+g2m_genes <- cc.genes$g2m.genes
+
+head(s_genes)
+head(g2m_genes)
+
+```
+# Score the cells based on cycle scores
+```{r}
+
+
+bxh <- CellCycleScoring(bxh, s.features = s_genes, g2m.features = g2m_genes, set.ident = TRUE)
+# view cell cycle scores and phase assignments
+head(bxh[[]])
+
+```
+```{r}
+### Visualize the distribution of cell cycle markers 
+RidgePlot(bxh, features = c("TPX2", "PCNA", "MCM4", "CDK1"), ncol = 2)
+# the scores of the cell cycle G2/M and S are lower than 10% as seen in the table
+```
+
+#Running a PCA on cell cycle genes: cells do not separate entirely by phase
+
+```{r}
+bxh <- RunPCA(bxh, features = c(s_genes, g2m_genes),verbose=F)
+DimPlot(bxh, reduction="pca")
+```
+#### Regress out cell cycle scores during data scaling: not required as the heterogeneity of cell cycles is not hugely impacting this data
+
+We could attempt to subtract ('regress out') this source of heterogeneity from the data. For each gene, Seurat models the relationship between gene expression and the S and G2M cell cycle scores. The scaled residuals of this model represent a 'corrected' expression matrix, that can be used downstream for dimensional reduction.
+
+
+After this regression,  a PCA on the variable genes no longer returns components associated with cell cycle
+(long time step)
+
+```{r}
+
+#bxh_regressout <- ScaleData(bxh, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(bxh)) 
+
+#bxh_regressout <- RunPCA(bxh_regressout, features = VariableFeatures(bxh_regressout), nfeatures.print = 10) 
+
+```
+
+
+# after regression out the cell cycle scores for the genes of the cells 
+```{r}
+#bxh_regressout <- RunPCA(bxh_regressout, features = c(s_genes, g2m_genes))
+
+#DimPlot(bxh_regressout)
+```
+# the regressing out for cell cycle heterogeneity removal does not change a lot  with the PCs explaining the variance so this step can be dropped .
+
+# 
+### PCA: orthogonal linear transformation of uncorrelated variables to yield its output for downstream cluster analysis 
+
+```{r}
+bxh <- RunPCA(bxh, features = VariableFeatures(bxh), nfeatures.print = 10)
+DimPlot(bxh)
+```
+
+```{r}
+VizDimLoadings(bxh, dims = 1:2, reduction = "pca") # see the highly variable genes in the PC1 and PC2
+Idents(bxh) <- bxh$orig.ident
+DimPlot(bxh)
+```
+
+
+#DimHeatmap allows for easy exploration of the primary sources of heterogeneity in a dataset, and can be useful when trying to decide which PCs to include for further downstream analyses. Both cells and features are ordered according to their PCA scores. Setting "cells" to a number plots the 'extreme' cells on both ends of the spectrum, which dramatically speeds plotting for large datasets.
+```{r}
+
+DimHeatmap(bxh, dims = 1:2,
+            #cells = 500, # plot the most extremevariable cells 500
+           balanced = TRUE)
+
+```
+### Determine the 'dimensionality' of the dataset: how many PCs explain the variance of the cells' gene expression
+#A heuristic method to decide the number of PC to consider generates an 'Elbow plot': a ranking of principle components based on the percentage of variance explained by each one (ElbowPlot function). In this example, we can observe an 'elbow' around PC9-10, suggesting that the majority of true signal is captured in the first 10 PCs.
+
+```{r}
+
+ElbowPlot(bxh) # 15 PCs can explain the variable features in the cells 
+``` 
+# cluster the cells
+```{r}
+
+
+bxh <- FindNeighbors(bxh, dims = 1:15) # first 15 PCs used; jaccard similarity neighbours between every cell and its k.param nearest neighbors for SNN clusters 
+bxh <- FindClusters(bxh, resolution = c(0.1,0.3,0.4,0.5)) # louvain modularity optimisation based on the clusters 
+
+
+head(Idents(bxh), 5)
+
+```
+
+# Run the nonlinearlity dimensionality reduction for visualisation tSNE (local and slower) and UMAP (global and faster)
+
+
+```{r}
+#### Visualization with tSNE (t-Stochastic Neighbourhood Embedding)
+bxh <- RunUMAP(bxh, dims = 1:15)
+DimPlot(bxh, reduction = "umap",label=T )
+
+#### Visualization with tSNE (t-Stochastic Neighbourhood Embedding)
+bxh <- RunTSNE(bxh, dims = 1:15)
+DimPlot(bxh, reduction = "tsne",label=T)
+
+```
+```{r}
+# visualisation with PCA
+DimPlot(bxh, reduction = "pca",label=T )
+
+```
+
+### Finding differentially expressed features (biomarkers of clusters)
+
+#### Find all markers of cluster 0
+
+```{r}
+c0_markers <- FindMarkers(bxh, 
+                          ident.1 = 0, 
+                          min.pct = 0.25) #only test genes that are detected in a minimum fraction of min.pct cells in either of the two populations
+head(c0_markers, n = 5)
+
+
+
+```
+
+#### Find markers for every cluster compared to all remaining cells, report only the positive ones: # upregulated genes
+
+```{r}
+
+bxh_markers <- FindAllMarkers(bxh, 
+                               only.pos = TRUE, 
+                               min.pct = 0.25,# present in atleast 25% of all cells
+                               logfc.threshold = 0.25)
+
+bxh_markers %>%
+    group_by(cluster) %>%
+    slice_max(n=2,order_by=avg_log2FC)
+
+```
+# Visualisation of Marker expression 
+```{r}
+#### VlnPlot shows expression probability distributions across clusters
+VlnPlot(bxh, features = c("RGCC", "CD3D","IL6ST"),pt.size=0)
+##ridgeplot
+RidgePlot(bxh, features = c("IGKC"))
+
+```
+
+# Feature plot for visualisation of expression on UMAP, t-SNE or PCA plot
+
+```{r}
+
+FeaturePlot(bxh, features = c("IGKC", "RGCC"))
+# RGCC in cell clusters 1,0,3,5 
+# IGKC in cell cluster 2
+
+```
+# Dotplot 
+
+```{r}
+DotPlot(bxh, features = c("RGCC","CD3D","IL6ST","MS4A1","AREG","IGKC", "GNLY", "IGHG1"))
+
+# #### DoHeatmap generates an expression heatmap for given cells and features.
+##Plot the top 3 markers (or all markers if less than 3) for each cluster.
+
+
+top3 <- bxh_markers %>% group_by(cluster) %>% top_n(n = 3, wt = avg_log2FC)
+DoHeatmap(bxh, features = top3$gene) + NoLegend()
+
+
+
+```
+# Annotation of the cell type labels for the cell clusters based on information from the reference containing info for the known cell type labels, reference-based annotation to select an annotated dataset to use as the reference. 
+
+```{r}
+library("SingleR")
+library("celldex") 
+library("SummarizedExperiment") 
+library("SingleCellExperiment")
+```
+
+
+```{r}
+# Loading Human Primary Cell Atlas dataset (Mabbott et al. 2013) as the reference
+ref.data <- HumanPrimaryCellAtlasData()
+ref.data
+ref.data$label.main[1:20]
+
+```
+```{r}
+bxh_sce<- as.SingleCellExperiment(DietSeurat(bxh)) #SingleCellExperiment structure derived from SummarizedExperiment for single-cell data
+bxh_sce
+```
+
+
+We predict cell types using the SingleR() function.
+test and ref parameters accept:
+- SummarizedExperiment/SummarizedCellExperiment object
+- A numeric matrix of single-cell expression values where rows are genes and columns are cells (usually the ref matrix is log-transformed)
+
+It is possible to use also a list of reference datasets. In this case only genes shared across the reference datasets will be used. 
+
+If fine.tune = TRUE and prune = TRUE additional fine-tuning step and label pruning steps are performed for each cell to improve resolution and remove low-quality labels. 
+
+```{r}
+predictions <- SingleR(test=bxh_sce, 
+    ref=ref.data, labels=ref.data$label.main, fine.tune = TRUE, prune = TRUE) 
+
+#predictions <- SingleR(test=bxh[["RNA"]]@counts, 
+    #ref=ref.data, labels=ref.data$label.main, fine.tune = TRUE, prune = TRUE)
+
+#DataFrame  containing the annotation statistics for each cell (one cell per row). Delta.next = a numeric vector containing the difference between the best and next-best score
+head(predictions)
+
+#summary of cell types annotation
+table(predictions$labels)
+table(predictions$pruned.labels)
+table(is.na(predictions$pruned.labels))
+
+```
+plotScoreHeatmap() displays the correlation-based scores for all cells across all reference labels. Each cell is a column while each row is a label in the reference dataset. The final label for each cell is shown in the top color bar. Similar scores for a group of labels indicates that the assignment is uncertain for those columns.
+
+```{r}
+plotScoreHeatmap(predictions)
+```
+plotDeltaDistribution() displays the "deltas", i.e., the difference between the score for the assigned label and the median across all labels for each cell. Low deltas indicate that the assignment is uncertain. Each point represents a cell assigned to that label. 
+
+```{r}
+plotDeltaDistribution(predictions, ncol = 3)
+# most of the cell types belong to B-cells, NK cells and T cells
+```
+
+Add cell types labels to the Seurat object
+
+```{r}
+identical(colnames(bxh),rownames(predictions))
+bxh@meta.data$SingleR_label<-predictions$pruned.labels
+
+DimPlot(bxh, group.by = "SingleR_label", label = TRUE,label.size = 1.5) + theme(legend.key.size = unit(0.5,'mm'))
+
+```
+
+
+
+### Compare the results to unsupervised clustering
+
+```{r}
+tab <- table(Assigned=predictions$pruned.labels, Clusters= bxh$seurat_clusters)
+tab
+# with the unsupervised clustering as well most of the cells belong to the B-cells, NK cells and T cells as seen with the SingleR results 
+```
+
+```{r}
+pheatmap::pheatmap(log10(tab+10), color=colorRampPalette(c("white","green"))(10))
+```
+# get the top 20 markers from each cluster based on their weight of average log2FC 
+```{r}
+top20 <- bxh_markers %>% group_by(cluster) %>% top_n(n = 20, wt = avg_log2FC)
+top20
+```
+
+
+
+
